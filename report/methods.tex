@@ -1,15 +1,6 @@
 % How each method works: one short definition and one diagram per method family.
-\tikzset{
-  box/.style={draw, rounded corners=2pt, align=center, font=\footnotesize, minimum height=6mm, inner sep=3pt, fill=white},
-  doc/.style={box, fill=gray!10},
-  llm/.style={box, fill=red!10},
-  model/.style={box, fill=blue!8},
-  arr/.style={-{Stealth[length=2mm]}, semithick},
-  lab/.style={font=\scriptsize\itshape, text=black!65}
-}
-
-\section{How each method works}\label{sec:methods}
-This section defines each method in a few sentences and shows its data flow. $q$ is the query, $d$
+\section{The methods compared}\label{sec:methods}
+This section defines each method HyDE is compared with, in a few sentences, and shows its data flow. $q$ is the query, $d$
 a document, and every method ends with a ranked list of document ids.
 
 \subsection{BM25 (lexical baseline)~\cite{kamphuis2020bm25,thakur2021beir}}
@@ -115,32 +106,9 @@ first-stage retriever: the Hybrid top 50 (Rerank) or the BM25-BEIR top 100 (BM25
 \end{tikzpicture}\end{center}
 
 \subsection{HyDE*: Hypothetical Document Embeddings~\cite{gao2023hyde}}
-\paragraph{Idea.} A dense retriever compares the query vector $f(q)$ with every document vector
-$f(d)$ and returns the nearest. But queries and documents are different kinds of text: a query is a
-few words (``Deleting Raptor reduces G-CSF levels.''), a document is a full abstract with its own
-vocabulary. Their vectors live in different parts of the space, so the nearest documents to a
-\emph{query} need not be the documents that \emph{answer} it. HyDE turns retrieval into
-document--document similarity, which encoders are good at: an LLM \emph{writes} $N$ plausible answer
-passages $\hat d_1,\dots,\hat d_N$ (``Please write a scientific paper passage to support/refute the
-claim''), and the search looks for real documents that are close to those fake ones. The passages
-may contain invented facts; that does not matter, because they are never shown to the user, only
-encoded. The LLM never sees the corpus.
-
-\begin{center}\begin{tikzpicture}[node distance=5mm]
-\node[doc] (q) {Query $q$};
-\node[llm, right=of q] (g) {LLM writes 8\\hypothetical passages};
-\node[model, right=of g] (e) {Encoder\\$f(q),f(\hat d_1),\dots,f(\hat d_8)$};
-\node[box, right=of e] (m) {Average\\vectors $\to \mathbf v$};
-\node[box, right=of m] (s) {Nearest docs\\to $\mathbf v$ $\to$ top 100};
-\draw[arr] (q)--(g); \draw[arr] (g)--(e); \draw[arr] (e)--(m); \draw[arr] (m)--(s);
-\draw[arr] (q.south) -- ++(0,-4mm) -| node[lab, pos=0.25, below]{query also encoded} (e.south);
-\end{tikzpicture}\end{center}
-The search vector is the mean of $f(q)$ and the eight passage vectors, and the search itself is
-the same nearest-neighbour search as Dense.
-
-\noindent\textit{* HyDE is the method we plan to use for our project, CCDB Search (semantic search over the CFPB Consumer Complaint Database). How the averaged
-vector finds the right documents, our measurements of it, and what they mean for CCDB Search are in
-Section~\ref{sec:ccdb}.}
+HyDE is the method of Part~I and is explained in detail in Section~\ref{sec:hydehow}. In short, an LLM
+writes eight hypothetical answer passages, and the mean of their bge embeddings and the query's is
+searched exactly like Dense.
 
 \subsection{RankGPT: listwise LLM reranking~\cite{sun2023rankgpt}}
 RankGPT gives an LLM the query and 20 numbered passages and asks it to output a ranking such as

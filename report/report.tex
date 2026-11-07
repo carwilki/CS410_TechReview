@@ -7,207 +7,90 @@
 \usepackage[hidelinks]{hyperref}
 \usepackage{xurl}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta}
+\usetikzlibrary{positioning,arrows.meta,calc}
+\tikzset{
+  box/.style={draw, rounded corners=2pt, align=center, font=\footnotesize, minimum height=6mm, inner sep=3pt, fill=white},
+  doc/.style={box, fill=gray!10},
+  llm/.style={box, fill=red!10},
+  model/.style={box, fill=blue!8},
+  arr/.style={-{Stealth[length=2mm]}, semithick},
+  lab/.style={font=\scriptsize\itshape, text=black!65}
+}
 
-\title{How Much Does Semantic Search Help? Twelve Retrieval Methods vs.\ BM25 on Four BEIR
-Collections, Checked Against Published Results\\[4pt]
-\large Spike T1 --- CS410 Technology Review: LLMs and Semantic Search}
+\title{HyDE for Semantic Search over Consumer Complaints:\\ How Hypothetical Document Embeddings Work,
+and How They Compare with Other Semantic Search Methods\\[4pt]
+\large CS410 Technology Review --- CCDB Search}
 \author{Carson Wilkins}
-\date{November 4, 2026}
+\date{November 7, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 \sloppy
-We compare twelve retrieval methods against a fixed BM25 baseline on four zero-shot BEIR collections
-(SciFact, NFCorpus, FiQA-2018, TREC-COVID). The methods are learned sparse (SPLADE), dense bi-encoders
-(bge-small, Contriever), late interaction (ColBERTv2/PLAID), RRF fusion, cross-encoder reranking and two
-LLM methods (HyDE query expansion and RankGPT listwise reranking with gpt-oss-120b). Every method
-from a paper is first reproduced: BM25 (BEIR configuration), BM25+cross-encoder, SPLADE, ColBERTv2,
-bge-small and Contriever land within $0.014$ nDCG@10 of their published numbers on every collection.
-HyDE does not reproduce with gpt-oss-120b and Contriever, and we show why. Against BM25, the
-semantic methods win clearly where queries are natural-language questions (FiQA, TREC-COVID: up to
-$+0.18$ and $+0.27$ nDCG@10) and modestly on SciFact and NFCorpus. RankGPT is the most effective
-system on three of four collections ($0.878$ on TREC-COVID, above the published gpt-4 result), and
-HyDE-bge is best on SciFact, but both cost 10--50\,s per query. Hybrid RRF gives most of the gain for
-about 10\,ms. Filling judgment holes with an LLM judge (Thomas et al.) widens the semantic methods'
-lead rather than closing it.
+This review studies Hypothetical Document Embeddings (HyDE) as the retrieval method for \emph{CCDB
+Search}, our planned semantic search over the consumer-written complaint narratives in the CFPB
+Consumer Complaint Database. Part~I explains how HyDE works: an LLM writes hypothetical answer
+documents for the query, and the mean of their embeddings and the query's embedding is used for
+nearest-neighbour search. Using real vectors from four BEIR collections we show how this averaged
+vector moves the search into the neighbourhood of the relevant documents (one SciFact claim's
+relevant abstract moves from rank 113 to rank 1), when it fails (unnormalized encoders, LLM output
+in the wrong style), and we turn these findings into design choices for CCDB Search. Part~II compares
+HyDE with the other main families of semantic search (learned sparse SPLADE, dense bi-encoders,
+ColBERTv2 late interaction, hybrid RRF fusion, cross-encoder reranking and RankGPT LLM reranking)
+against a BM25 baseline on SciFact, NFCorpus, FiQA and TREC-COVID, after reproducing each method's
+published results. HyDE with bge-small is the strongest first-stage retriever on three of the four
+collections ($+0.090$ nDCG@10 over BM25 on SciFact) but costs 10--19\,s per query; RankGPT is the
+most effective system overall, and hybrid fusion gives most of the gain for about 10\,ms. Semantic
+search helps most where queries and documents are worded differently, which is the situation CCDB
+Search is built for.
 \end{abstract}
 
-\section{Why these collections}
-A first run of this spike on the CS410 MP collections (archived in \texttt{archive\_mp/}) used short
-keyword queries and lexically pooled judgments, so it mostly tested semantic methods on BM25's home
-ground. This run uses four BEIR~\cite{thakur2021beir} test collections where query and relevant text
-tend to be worded differently (Table~\ref{tab:data}).
-
-\begin{table}[H]\centering\small
-\caption{Collections (BEIR test splits). All queries have at least one relevant document.}\label{tab:data}
-\begin{tabularx}{\linewidth}{lrrrlX}\toprule
-Collection & Docs & Queries & Qrels & Grades & What it tests\\\midrule
-SciFact~\cite{wadden2020scifact} & 5,183 & 300 & 339 & 1 & Scientific claims $\to$ supporting abstracts\\
-NFCorpus~\cite{boteva2016nfcorpus} & 3,633 & 323 & 12,334 & 1--2 & Lay health queries $\to$ medical papers\\
-FiQA-2018~\cite{maia2018fiqa} & 57,638 & 648 & 1,706 & 1 & Natural-language finance questions $\to$ forum answers\\
-TREC-COVID~\cite{voorhees2020treccovid} & 171,332 & 50 & 66,336 & 0--2 & COVID questions $\to$ CORD-19 abstracts; deep pools\\
-\bottomrule\end{tabularx}
-\end{table}
-
-\input{methods.tex}
-
-\section{Systems}
-There is one script per method; all see the same corpus (title + body) and the test queries, and
-each returns a top-100 list. Nothing was tuned on the test queries. Section~\ref{sec:methods} explains how each method works; Table~\ref{tab:sys} lists the
-exact configurations; ``repro.'' marks a system configured to match a published result.
-
-\begin{table}[H]\centering\small
-\caption{Systems. LLM calls go through the Databricks Unity Gateway; every call is cached on disk. *\,The method planned for CCDB Search over the CFPB Consumer Complaint Database (Section~\ref{sec:ccdb}).}\label{tab:sys}
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.7cm}>{\raggedright\arraybackslash}p{2.6cm}X}\toprule
-System & Source & Configuration\\\midrule
-BM25 (baseline) & BEIR~\cite{thakur2021beir}, \cite{kamphuis2020bm25} & \texttt{bm25s}, Lucene variant, $k_1{=}1.2$, $b{=}0.75$, stopwords, Snowball stemmer\\
-BM25-BEIR (repro.) & BEIR~\cite{thakur2021beir} & Anserini setting: $k_1{=}0.9$, $b{=}0.4$, Porter stemmer, title and body indexed as separate fields with scores summed\\
-SPLADE (repro.) & \cite{formal2021splade,formal2021spladev2} & \texttt{naver/splade\_v2\_distil}, 256 tokens, sparse dot product\\
-Dense (repro.) & DPR~\cite{karpukhin2020dpr}; \cite{xiao2023cpack,bge2023card} & \texttt{bge-small-en-v1.5}, CLS pooling, normalized, query instruction prefix, exact cosine search\\
-Contriever (repro.) & \cite{izacard2022contriever}, HyDE T2~\cite{gao2023hyde} & \texttt{facebook/contriever} (unsupervised), mean pooling, unnormalized dot product\\
-ColBERTv2 (repro.) & \cite{khattab2020colbert,santhanam2022colbertv2,santhanam2022plaid} & \texttt{colbertv2.0} via PyLate, PLAID index, 2-bit residuals, doc 300 / query 32 tokens\\
-Hybrid & Cormack et al.~\cite{cormack2009rrf} & RRF of BM25 and Dense, $\sum 1/(60+r)$ with $r$ from 1 as in the paper\\
-Rerank & BEIR~\cite{thakur2021beir}, \cite{wang2020minilm} & \texttt{ms-marco-MiniLM-L-6-v2} rescores the Hybrid top 50\\
-BM25+CE (repro.) & BEIR T2~\cite{thakur2021beir} & Same cross-encoder on the BM25-BEIR top 100\\
-HyDE-bge* & HyDE~\cite{gao2023hyde} & gpt-oss-120b writes 8 passages per query (temp.\ 0.7, 512 tokens, the paper's prompts); query vector = mean of query and passage embeddings; bge encoder\\
-HyDE-Contriever (repro.) & HyDE~\cite{gao2023hyde} & As above with the paper's Contriever encoder\\
-HyDE-Contriever-100w & ours & As above, but passages are stripped of markdown and cut to 100 words before encoding (Section~\ref{sec:hyde})\\
-RankGPT (repro.) & Sun et al.~\cite{sun2023rankgpt} & Official prompts, passages cut to 300 words, sliding window 20 / step 10 over the BM25-BEIR top 100; gpt-oss-120b, temperature 0\\
-\bottomrule\end{tabularx}
-\end{table}
-
-\noindent Implementation notes from checking each paper:
-\begin{itemize}
-\item BEIR's BM25 baseline is Anserini/Lucene with $k_1{=}0.9$, $b{=}0.4$ and multi-field indexing.
-  Our default BM25 keeps the common $k_1{=}1.2$, $b{=}0.75$; it scores slightly higher on SciFact and
-  FiQA and lower on TREC-COVID, so we report both.
-\item PyTerrier's \texttt{RRFusion}~\cite{macdonald2020pyterrier,pyterrierdocs} uses 0-based ranks,
-  i.e.\ $1/(k+r-1)$ with 1-based $r$; we follow the original paper.
-\item DPR used an unnormalized dot product, FAISS HNSW search and a linear BM25 hybrid
-  ($\lambda{=}1.1$). We use cosine scoring as specified by the bge model card, exact search, and RRF.
-\item SPLADE scores $0.703$ on SciFact at 512 tokens; the paper's 256-token setting gives $0.693$,
-  matching the published number exactly.
-\item The LLMs differ from the papers': gpt-oss-120b (reasoning effort ``low'') replaces
-  text-davinci-003 (HyDE) and gpt-3.5/gpt-4 (RankGPT). The judge is Qwen3.5-122B-A10B with thinking off,
-  deliberately a different model from the one doing the reranking.
-\end{itemize}
-
-\textbf{Evaluation.} \texttt{ir-measures} (pytrec\_eval) on the graded test qrels: nDCG@10
-(primary), Recall@100 (secondary), P@10 and AP@100; unjudged documents count as non-relevant, as in
-BEIR. R$_{cap}$@100 divides by $\min(|\mathrm{rel}|,100)$, as in BEIR Table 9. Each system is compared
-with BM25 on per-query nDCG@10 with a paired $t$-test. BEIR runs no significance tests; the test is
-our addition, following Smucker et al.~\cite{smucker2007significance}. Latency is the mean
-wall-clock time per query on an Apple M5 Max (PyTorch MPS), model load excluded. Seeds are fixed at 0.
-
-\section{Reproductions against published results}
-Table~\ref{tab:pub} puts each reproduction next to the number its paper reports. Six of seven
-methods reproduce: the largest gap is $0.013$ (BM25-BEIR on TREC-COVID), and SPLADE, bge-small and
-Contriever agree to within $0.003$ on every collection. BM25-BEIR also matches BEIR's capped
-Recall@100 (TREC-COVID $0.499$ vs.\ $0.498$), and the cross-encoder setup matches BEIR's BM25+CE rows
-to within $0.005$. These agreements matter because they show the pipeline, data and metric code are
-right, so the differences in Section~\ref{sec:res} come from the methods.
-
-\subsection{HyDE does not reproduce with gpt-oss}\label{sec:hyde}
-HyDE-Contriever reaches only $0.556$ / $0.063$ / $0.434$ (SciFact / FiQA / TREC-COVID) against the
-published $0.691$ / $0.273$ / $0.593$, which is \emph{below} Contriever alone. Contriever itself
-reproduces exactly, so the cause is in the generated passages. gpt-oss-120b writes long answers
-(median 507 words on FiQA, many with markdown headings and tables), far longer than the paper's
-passages. Contriever's mean-pooled vectors are not normalized, so these long, formatted passages
-dominate the averaged query vector. Stripping markdown and cutting each passage to 100 words
-(HyDE-Contriever-100w) recovers SciFact ($0.684$) and FiQA ($0.285$, above the published $0.273$) but
-hurts TREC-COVID ($0.351$), so it is not a general fix, and we report it as our variant, not a
-reproduction. With the normalized bge encoder the same passages work well: HyDE-bge improves on Dense
-on SciFact ($+0.056$), NFCorpus ($+0.021$) and FiQA ($+0.007$) and ties on TREC-COVID ($-0.002$). HyDE
-is therefore sensitive to the generator's output style in a way the paper, using one generator, did
-not have to address.
-
-\subsection{RankGPT with gpt-oss beats the published gpt-3.5 results}
-Reranking the same BM25 top 100, RankGPT with gpt-oss-120b scores $0.765$ / $0.383$ / $0.878$
-(SciFact / NFCorpus / TREC-COVID), against $0.704$ / $0.356$ / $0.767$ for gpt-3.5-turbo and
-$0.750$ / $0.385$ / $0.855$ for gpt-4 in the paper. The gpt-4 rows reranked gpt-3.5's top 30, not BM25's
-top 100, so that comparison is not like-for-like. Our BM25-BEIR first stage is also stronger than
-the paper's Pyserini BM25 on TREC-COVID ($0.669$ vs.\ $0.595$), which accounts for part of the gap.
-Output problems were rare: across 11,022 windows, 12 duplicate ids, 994 missing ids (appended in
-original order by the official \texttt{receive\_permutation}) and 4 empty responses.
-
-\section{Results against BM25}\label{sec:res}
-\input{tables.tex}
-
-\begin{figure}[H]\centering
-\includegraphics[width=\linewidth]{ndcg10.pdf}
-\caption{nDCG@10 per system and collection; dashed line = BM25 baseline.}\label{fig:ndcg}
-\end{figure}
-
-\paragraph{Natural-language questions gain most.} On FiQA every system built on a supervised
-encoder beats BM25 with $p<0.001$: Dense $+0.150$ (313 wins, 86 losses), HyDE-bge $+0.157$, and
-RankGPT $+0.176$. On TREC-COVID, Dense, Hybrid, Rerank, HyDE-bge and RankGPT gain $+0.15$ to $+0.27$;
-RankGPT wins 43 of 50 queries. On SciFact (declarative claims sharing technical terms with abstracts)
-and NFCorpus (short topic titles), the gains are $+0.01$ to $+0.09$, and several systems are not
-significantly better than BM25.
-
-\paragraph{Supervised training transfer matters more than architecture.} Unsupervised Contriever
-never beats BM25 and collapses on TREC-COVID ($0.274$), as in the HyDE paper. SPLADE and ColBERTv2,
-both trained on MS MARCO, beat BM25 on FiQA and TREC-COVID but trail the much smaller bge-small, whose
-training mixture is broader. The bge release does not document its English training data at the
-dataset level, so some overlap with these collections cannot be ruled out (Section~\ref{sec:threats}).
-
-\paragraph{Hybrid is the cheap, reliable choice.} RRF of BM25 and Dense is significantly better than
-BM25 with $p<0.001$ on all four collections and is within $0.10$ of the best system everywhere, at
-about 10\,ms per query. Its one weakness is FiQA, where equal-weight fusion with the weak BM25 list
-lowers nDCG@10 from Dense's $0.403$ to $0.366$.
-
-\paragraph{Rerankers: the small cross-encoder helps a little, the LLM a lot.} The MS MARCO MiniLM
-cross-encoder adds $+0.01$ to $+0.15$ over BM25 but at most $+0.005$ over Hybrid. RankGPT on the same
-BM25 list as BM25+CE is far better on every collection ($+0.076$ on SciFact, $+0.078$ on FiQA,
-$+0.116$ on TREC-COVID).
-
-\paragraph{Recall@100.} Semantic first stages miss fewer relevant documents (Table~\ref{tab:sec}),
-e.g.\ FiQA $0.553\to0.727$ (HyDE-bge) and NFCorpus $0.247\to0.333$. The rerankers cannot raise
-Recall@100 above that of their first stage, which matters for retrieval-augmented generation, where
-the LLM only sees what the first stage retrieved.
-
-\subsection{Judgment holes: does pooling bias favour BM25?}\label{sec:holes}
-Semantic systems retrieve many documents that were never judged; scoring them as non-relevant could
-understate those systems. Following Thomas et al.~\cite{thomas2024llmjudge}, we labelled every
-unjudged document in any system's top 10 with an LLM judge using the paper's prompt: 63,029 pairs
-in total, 18 of which failed and stay unjudged.
-
-\textbf{Validation first.} On 200 stratified human-judged TREC-COVID pairs, the judge agrees with
-humans at Cohen's $\kappa=0.53$ (binary and 3-class linear-weighted) and 62.5\% exact agreement, which
-is moderate agreement. The other qrels contain only relevant documents, so $\kappa$ is undefined there;
-the judge labels 80\% (SciFact) and 91\% (FiQA) of known-relevant documents as relevant, but only 27\%
-on NFCorpus, whose relevance labels come from citation links rather than direct reading. The
-NFCorpus augmented numbers should therefore not be relied on.
-
-\textbf{Results.} Table~\ref{tab:aug} rescored all systems with human labels plus LLM labels for
-the holes. All scores rise, because the holes contain relevant documents, and the semantic and LLM
-systems gain the most: on FiQA, BM25 rises $0.253\to0.506$ while HyDE-bge rises $0.410\to0.751$ and
-RankGPT $0.429\to0.799$; on TREC-COVID, Dense's gain over BM25 grows from $+0.147$ to $+0.169$. So
-pooling bias does affect these comparisons, and if anything it understates the semantic methods.
-One caveat applies to the LLM methods: an LLM judge may favour documents another LLM picked, even a
-different model.
-
-\section{HyDE* for CCDB Search}\label{sec:ccdb}
-HyDE is the retrieval method we plan to use for our project, \textbf{CCDB Search}: semantic search over
-the CFPB Consumer Complaint Database (CCDB), the U.S.\ Consumer Financial Protection Bureau's public
+\section{Introduction}\label{sec:intro}
+The CFPB Consumer Complaint Database (CCDB) is the U.S.\ Consumer Financial Protection Bureau's public
 collection of consumer complaints about financial products and services such as credit reporting,
 debt collection, mortgages, credit cards and bank accounts. Many complaints include a free-text
-narrative written by the consumer (published only with the consumer's consent and with personal
-details scrubbed). These narratives are what CCDB Search will retrieve. This section
-explains in detail how it finds documents (Section~\ref{sec:hydehow}), shows what it does on the four
-test collections (Section~\ref{sec:hydegeo}), and turns the results into design choices for CCDB
-Search (Section~\ref{sec:hydeccdb}).
+narrative written by the consumer, published only with the consumer's consent and with personal
+details scrubbed. These narratives are what our project, \textbf{CCDB Search}, will retrieve.
 
-We chose it for three reasons from this study. (i) It was the strongest single first-stage retriever on three of the four collections:
-HyDE-bge has the highest nDCG@10 of any non-reranking system on SciFact, NFCorpus and FiQA, and
-beats BM25 on all four collections. (ii) It needs no training and no labelled data, which matters
-for a new collection with no relevance judgments. (iii) It reuses an ordinary dense index: the LLM only
-rewrites the query, so the corpus is embedded once and never sent to the LLM.
+Searching them is a vocabulary-mismatch problem. A user types a short query, for example ``charged
+twice for an overdraft'', while the complaints that match it are long first-person stories that may
+use none of those words. Keyword search (BM25) only finds documents that share the query's terms.
+\emph{Semantic search} instead maps queries and documents to vectors so that texts with the same
+meaning are close even when their words differ. HyDE~\cite{gao2023hyde} goes one step further: it
+first asks an LLM to write what a matching document might look like, and searches with that.
 
-\subsection{How the averaged vector finds the right documents}\label{sec:hydehow}
+The review has two parts. \textbf{Part~I} explains HyDE in depth (Section~\ref{sec:hydehow}),
+measures what it does to the query vector on real data (Section~\ref{sec:hydegeo}), and derives the
+design of CCDB Search from those measurements (Section~\ref{sec:ccdb}). \textbf{Part~II} compares HyDE
+with the other main semantic search methods on four public test collections, reproducing published
+results first so that the comparison can be trusted. The CCDB has no relevance judgments, so it could
+not be evaluated directly; the BEIR collections stand in for it.
+
+\part{HyDE for CCDB Search}
+
+\section{How HyDE works}\label{sec:hydehow}
+\paragraph{Idea.} A dense retriever compares the query vector $f(q)$ with every document vector
+$f(d)$ and returns the nearest. But queries and documents are different kinds of text: a query is a
+few words (``Deleting Raptor reduces G-CSF levels.''), a document is a full abstract with its own
+vocabulary. Their vectors live in different parts of the space, so the nearest documents to a
+\emph{query} need not be the documents that \emph{answer} it. HyDE turns retrieval into
+document--document similarity, which encoders are good at: an LLM \emph{writes} $N$ plausible answer
+passages $\hat d_1,\dots,\hat d_N$ (``Please write a scientific paper passage to support/refute the
+claim''), and the search looks for real documents that are close to those fake ones. The passages
+may contain invented facts; that does not matter, because they are never shown to the user, only
+encoded. The LLM never sees the corpus.
+
+\begin{center}\begin{tikzpicture}[node distance=5mm]
+\node[doc] (q) {Query $q$};
+\node[llm, right=of q] (g) {LLM writes 8\\hypothetical passages};
+\node[model, right=of g] (e) {Encoder\\$f(q),f(\hat d_1),\dots,f(\hat d_8)$};
+\node[box, right=of e] (m) {Average\\vectors $\to \mathbf v$};
+\node[box, right=of m] (s) {Nearest docs\\to $\mathbf v$ $\to$ top 100};
+\draw[arr] (q)--(g); \draw[arr] (g)--(e); \draw[arr] (e)--(m); \draw[arr] (m)--(s);
+\draw[arr] (q.south) -- ++(0,-4mm) -| node[lab, pos=0.25, below]{query also encoded} (e.south);
+\end{tikzpicture}\end{center}
+
 \paragraph{The averaged vector.} The search vector is the mean of the query embedding and the $N$
 passage embeddings (the paper's Eq.~8; we use $N=8$, as the official code does):
 \[
@@ -304,14 +187,14 @@ swamp $f(q)$, and the mean drifts toward whatever the passages over-emphasize.
   \end{scope}
 \end{tikzpicture}\end{center}
 
-\subsection{What the averaged vector does on real data}\label{sec:hydegeo}
+\section{HyDE on real data: what the averaged vector does}\label{sec:hydegeo}
 To see this mechanism in the real system, we re-encoded the cached
 gpt-oss passages and measured, for every query with a judged-relevant document, how the query vector
 $f(q)$, the individual passage vectors $f(\hat d_k)$ and the HyDE vector $\mathbf v$ relate to the
 relevant documents. The script is \texttt{retrieval\_eval.evaluation.hyde\_geometry}; it makes no new LLM calls.
 Table~\ref{tab:hydegeo} summarizes it.
 
-\paragraph{Worked example.} SciFact claim 324 is ``Deleting Raptor reduces G-CSF levels.'' Its
+\paragraph{Worked example.} SciFact (scientific claims, Section~\ref{sec:data}) claim 324 is ``Deleting Raptor reduces G-CSF levels.'' Its
 relevant abstract never uses the word \emph{Raptor}; it is about ``mTOR signalling'' regulating
 ``G-CSF'' in mammary tumours. Searching with $f(q)$ ranks it 113th, and none of the query's top 10 is
 relevant. The first gpt-oss passage begins ``Raptor, a core component of the mechanistic target of
@@ -360,6 +243,20 @@ SciFact ($+0.056$), small on FiQA ($+0.007$).
 helps.}\label{fig:hydescatter}
 \end{figure}
 
+\paragraph{The published setup does not reproduce with gpt-oss.}\label{sec:hyde}
+HyDE-Contriever reaches only $0.556$ / $0.063$ / $0.434$ (SciFact / FiQA / TREC-COVID) against the
+published $0.691$ / $0.273$ / $0.593$, which is \emph{below} Contriever alone. Contriever itself
+reproduces exactly, so the cause is in the generated passages. gpt-oss-120b writes long answers
+(median 507 words on FiQA, many with markdown headings and tables), far longer than the paper's
+passages. Contriever's mean-pooled vectors are not normalized, so these long, formatted passages
+dominate the averaged query vector. Stripping markdown and cutting each passage to 100 words
+(HyDE-Contriever-100w) recovers SciFact ($0.684$) and FiQA ($0.285$, above the published $0.273$) but
+hurts TREC-COVID ($0.351$), so it is not a general fix, and we report it as our variant, not a
+reproduction. With the normalized bge encoder the same passages work well: HyDE-bge improves on Dense
+on SciFact ($+0.056$), NFCorpus ($+0.021$) and FiQA ($+0.007$) and ties on TREC-COVID ($-0.002$). HyDE
+is therefore sensitive to the generator's output style in a way the paper, using one generator, did
+not have to address.
+
 \paragraph{Why Contriever fails.} The same passages hurt Contriever, and the norms explain it.
 Contriever's query vectors have length $\approx1.35$, the passages $\approx2.0$ and corpus
 documents $\approx1.75$. In the unnormalized mean the eight long passages dominate: $\mathbf v$
@@ -372,8 +269,37 @@ works when (i) the generator writes passages in the corpus's style and (ii) the 
 each vector an equal say. With bge both hold, and HyDE-bge is one of the best systems we tested.
 
 
-\subsection{Design choices for CCDB Search}\label{sec:hydeccdb}
-The measurements above give a recipe, and a list of things that break HyDE:
+\section{Applying HyDE to CCDB Search}\label{sec:ccdb}\label{sec:hydeccdb}
+We chose HyDE for CCDB Search for three reasons from this study. (i) It was the strongest single
+first-stage retriever on three of the four test collections: HyDE-bge has the highest nDCG@10 of any
+non-reranking system on SciFact, NFCorpus and FiQA, and beats BM25 on all four (Part~II). (ii) It
+needs no training and no labelled data, which matters for a collection with no relevance
+judgments. (iii) It reuses an ordinary dense index: the LLM only rewrites the query, so the
+narratives are embedded once and never sent to the LLM.
+
+\paragraph{Planned pipeline.} The narratives are embedded once with a normalized encoder and stored
+in a vector index. At query time the LLM writes a few complaint-style narratives for the query, these
+and the query are embedded and averaged, and the index returns the nearest complaints. Because the
+LLM step takes seconds, plain dense results for $f(q)$ can be shown first and replaced when the HyDE
+results arrive.
+\begin{center}\begin{tikzpicture}[node distance=5mm]
+\node[doc] (n) {CFPB complaint\\narratives};
+\node[model, right=of n] (en) {bge encoder\\(normalized)};
+\node[box, right=of en] (ix) {vector index};
+\node[lab, left=2mm of n] {offline};
+\draw[arr] (n)--(en); \draw[arr] (en)--(ix);
+\node[doc, below=16mm of n] (q) {user query $q$};
+\node[lab, left=2mm of q] {online};
+\node[llm, right=of q] (g) {LLM writes $N$\\complaint narratives};
+\node[model, right=of g] (e) {bge encoder\\$f(q), f(\hat d_k)$};
+\node[box, right=of e] (v) {mean $\to\mathbf v$};
+\node[box, right=of v] (r) {ranked\\complaints};
+\draw[arr] (q)--(g); \draw[arr] (g)--(e); \draw[arr] (e)--(v); \draw[arr] (v)--(r);
+\draw[arr] (v.north) |- (ix.east); \node[lab, anchor=west] at ($(v.north)+(1mm,6mm)$) {$k$-NN search in index};
+\draw[arr, dashed] (q.south) -- ++(0,-5mm) -| node[lab, pos=0.25, below]{dense results for $f(q)$ shown first} (r.south);
+\end{tikzpicture}\end{center}
+
+\paragraph{Design choices.} The measurements of Section~\ref{sec:hydegeo} give a recipe, and a list of things that break HyDE:
 \begin{itemize}\itemsep 0pt
 \item \textbf{Use a normalized encoder} (bge-style, unit vectors). With Contriever's unnormalized
 vectors the same passages made results \emph{worse} than no HyDE at all.
@@ -399,6 +325,151 @@ document lower with HyDE. Fusing HyDE with BM25 or Dense (as Hybrid does) is a c
 \item \textbf{Evaluate on the CCDB itself.} Gains ranged from $+0.056$ (SciFact) to $-0.002$
 (TREC-COVID), so a small set of judged CCDB queries (e.g.\ labelled with the LLM judge of Section~\ref{sec:holes}, after checking it against a few human labels) is needed before relying on it.
 \end{itemize}
+
+\part{Comparison with other semantic search methods}
+
+\section{Test collections}\label{sec:data}
+The CFPB Consumer Complaint Database has no relevance judgments, so the comparison uses four
+public BEIR~\cite{thakur2021beir} test collections where, as in complaint search, the query and the
+relevant text tend to be worded differently (Table~\ref{tab:data}). FiQA, natural-language finance
+questions answered from forum posts, is the closest to the CCDB.
+
+\begin{table}[H]\centering\small
+\caption{Collections (BEIR test splits). All queries have at least one relevant document.}\label{tab:data}
+\begin{tabularx}{\linewidth}{lrrrlX}\toprule
+Collection & Docs & Queries & Qrels & Grades & What it tests\\\midrule
+SciFact~\cite{wadden2020scifact} & 5,183 & 300 & 339 & 1 & Scientific claims $\to$ supporting abstracts\\
+NFCorpus~\cite{boteva2016nfcorpus} & 3,633 & 323 & 12,334 & 1--2 & Lay health queries $\to$ medical papers\\
+FiQA-2018~\cite{maia2018fiqa} & 57,638 & 648 & 1,706 & 1 & Natural-language finance questions $\to$ forum answers\\
+TREC-COVID~\cite{voorhees2020treccovid} & 171,332 & 50 & 66,336 & 0--2 & COVID questions $\to$ CORD-19 abstracts; deep pools\\
+\bottomrule\end{tabularx}
+\end{table}
+
+\input{methods.tex}
+
+\section{Systems and evaluation}
+There is one script per method; all see the same corpus (title + body) and the test queries, and
+each returns a top-100 list. Nothing was tuned on the test queries. Section~\ref{sec:methods} explains how each method works; Table~\ref{tab:sys} lists the
+exact configurations; ``repro.'' marks a system configured to match a published result.
+
+\begin{table}[H]\centering\small
+\caption{Systems. LLM calls go through the Databricks Unity Gateway; every call is cached on disk. *\,The method planned for CCDB Search over the CFPB Consumer Complaint Database (Section~\ref{sec:ccdb}).}\label{tab:sys}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.7cm}>{\raggedright\arraybackslash}p{2.6cm}X}\toprule
+System & Source & Configuration\\\midrule
+BM25 (baseline) & BEIR~\cite{thakur2021beir}, \cite{kamphuis2020bm25} & \texttt{bm25s}, Lucene variant, $k_1{=}1.2$, $b{=}0.75$, stopwords, Snowball stemmer\\
+BM25-BEIR (repro.) & BEIR~\cite{thakur2021beir} & Anserini setting: $k_1{=}0.9$, $b{=}0.4$, Porter stemmer, title and body indexed as separate fields with scores summed\\
+SPLADE (repro.) & \cite{formal2021splade,formal2021spladev2} & \texttt{naver/splade\_v2\_distil}, 256 tokens, sparse dot product\\
+Dense (repro.) & DPR~\cite{karpukhin2020dpr}; \cite{xiao2023cpack,bge2023card} & \texttt{bge-small-en-v1.5}, CLS pooling, normalized, query instruction prefix, exact cosine search\\
+Contriever (repro.) & \cite{izacard2022contriever}, HyDE T2~\cite{gao2023hyde} & \texttt{facebook/contriever} (unsupervised), mean pooling, unnormalized dot product\\
+ColBERTv2 (repro.) & \cite{khattab2020colbert,santhanam2022colbertv2,santhanam2022plaid} & \texttt{colbertv2.0} via PyLate, PLAID index, 2-bit residuals, doc 300 / query 32 tokens\\
+Hybrid & Cormack et al.~\cite{cormack2009rrf} & RRF of BM25 and Dense, $\sum 1/(60+r)$ with $r$ from 1 as in the paper\\
+Rerank & BEIR~\cite{thakur2021beir}, \cite{wang2020minilm} & \texttt{ms-marco-MiniLM-L-6-v2} rescores the Hybrid top 50\\
+BM25+CE (repro.) & BEIR T2~\cite{thakur2021beir} & Same cross-encoder on the BM25-BEIR top 100\\
+HyDE-bge* & HyDE~\cite{gao2023hyde} & gpt-oss-120b writes 8 passages per query (temp.\ 0.7, 512 tokens, the paper's prompts); query vector = mean of query and passage embeddings; bge encoder\\
+HyDE-Contriever (repro.) & HyDE~\cite{gao2023hyde} & As above with the paper's Contriever encoder\\
+HyDE-Contriever-100w & ours & As above, but passages are stripped of markdown and cut to 100 words before encoding (Section~\ref{sec:hyde})\\
+RankGPT (repro.) & Sun et al.~\cite{sun2023rankgpt} & Official prompts, passages cut to 300 words, sliding window 20 / step 10 over the BM25-BEIR top 100; gpt-oss-120b, temperature 0\\
+\bottomrule\end{tabularx}
+\end{table}
+
+\noindent Implementation notes from checking each paper:
+\begin{itemize}
+\item BEIR's BM25 baseline is Anserini/Lucene with $k_1{=}0.9$, $b{=}0.4$ and multi-field indexing.
+  Our default BM25 keeps the common $k_1{=}1.2$, $b{=}0.75$; it scores slightly higher on SciFact and
+  FiQA and lower on TREC-COVID, so we report both.
+\item PyTerrier's \texttt{RRFusion}~\cite{macdonald2020pyterrier,pyterrierdocs} uses 0-based ranks,
+  i.e.\ $1/(k+r-1)$ with 1-based $r$; we follow the original paper.
+\item DPR used an unnormalized dot product, FAISS HNSW search and a linear BM25 hybrid
+  ($\lambda{=}1.1$). We use cosine scoring as specified by the bge model card, exact search, and RRF.
+\item SPLADE scores $0.703$ on SciFact at 512 tokens; the paper's 256-token setting gives $0.693$,
+  matching the published number exactly.
+\item The LLMs differ from the papers': gpt-oss-120b (reasoning effort ``low'') replaces
+  text-davinci-003 (HyDE) and gpt-3.5/gpt-4 (RankGPT). The judge is Qwen3.5-122B-A10B with thinking off,
+  deliberately a different model from the one doing the reranking.
+\end{itemize}
+
+\textbf{Evaluation.} \texttt{ir-measures} (pytrec\_eval) on the graded test qrels: nDCG@10
+(primary), Recall@100 (secondary), P@10 and AP@100; unjudged documents count as non-relevant, as in
+BEIR. R$_{cap}$@100 divides by $\min(|\mathrm{rel}|,100)$, as in BEIR Table 9. Each system is compared
+with BM25 on per-query nDCG@10 with a paired $t$-test. BEIR runs no significance tests; the test is
+our addition, following Smucker et al.~\cite{smucker2007significance}. Latency is the mean
+wall-clock time per query on an Apple M5 Max (PyTorch MPS), model load excluded. Seeds are fixed at 0.
+
+\section{Reproductions against published results}
+Table~\ref{tab:pub} puts each reproduction next to the number its paper reports. Six of seven
+methods reproduce: the largest gap is $0.013$ (BM25-BEIR on TREC-COVID), and SPLADE, bge-small and
+Contriever agree to within $0.003$ on every collection. BM25-BEIR also matches BEIR's capped
+Recall@100 (TREC-COVID $0.499$ vs.\ $0.498$), and the cross-encoder setup matches BEIR's BM25+CE rows
+to within $0.005$. These agreements matter because they show the pipeline, data and metric code are
+right, so the differences in Section~\ref{sec:res} come from the methods.
+
+\subsection{RankGPT with gpt-oss beats the published gpt-3.5 results}
+Reranking the same BM25 top 100, RankGPT with gpt-oss-120b scores $0.765$ / $0.383$ / $0.878$
+(SciFact / NFCorpus / TREC-COVID), against $0.704$ / $0.356$ / $0.767$ for gpt-3.5-turbo and
+$0.750$ / $0.385$ / $0.855$ for gpt-4 in the paper. The gpt-4 rows reranked gpt-3.5's top 30, not BM25's
+top 100, so that comparison is not like-for-like. Our BM25-BEIR first stage is also stronger than
+the paper's Pyserini BM25 on TREC-COVID ($0.669$ vs.\ $0.595$), which accounts for part of the gap.
+Output problems were rare: across 11,022 windows, 12 duplicate ids, 994 missing ids (appended in
+original order by the official \texttt{receive\_permutation}) and 4 empty responses.
+HyDE is the exception: with gpt-oss-120b and Contriever it does not reproduce the paper, for reasons
+explained in Section~\ref{sec:hyde}.
+
+\section{Results: semantic search vs.\ the BM25 baseline}\label{sec:res}
+\input{tables.tex}
+
+\begin{figure}[H]\centering
+\includegraphics[width=\linewidth]{ndcg10.pdf}
+\caption{nDCG@10 per system and collection; dashed line = BM25 baseline.}\label{fig:ndcg}
+\end{figure}
+
+\paragraph{Natural-language questions gain most.} On FiQA every system built on a supervised
+encoder beats BM25 with $p<0.001$: Dense $+0.150$ (313 wins, 86 losses), HyDE-bge $+0.157$, and
+RankGPT $+0.176$. On TREC-COVID, Dense, Hybrid, Rerank, HyDE-bge and RankGPT gain $+0.15$ to $+0.27$;
+RankGPT wins 43 of 50 queries. On SciFact (declarative claims sharing technical terms with abstracts)
+and NFCorpus (short topic titles), the gains are $+0.01$ to $+0.09$, and several systems are not
+significantly better than BM25.
+
+\paragraph{Supervised training transfer matters more than architecture.} Unsupervised Contriever
+never beats BM25 and collapses on TREC-COVID ($0.274$), as in the HyDE paper. SPLADE and ColBERTv2,
+both trained on MS MARCO, beat BM25 on FiQA and TREC-COVID but trail the much smaller bge-small, whose
+training mixture is broader. The bge release does not document its English training data at the
+dataset level, so some overlap with these collections cannot be ruled out (Section~\ref{sec:threats}).
+
+\paragraph{Hybrid is the cheap, reliable choice.} RRF of BM25 and Dense is significantly better than
+BM25 with $p<0.001$ on all four collections and is within $0.10$ of the best system everywhere, at
+about 10\,ms per query. Its one weakness is FiQA, where equal-weight fusion with the weak BM25 list
+lowers nDCG@10 from Dense's $0.403$ to $0.366$.
+
+\paragraph{Rerankers: the small cross-encoder helps a little, the LLM a lot.} The MS MARCO MiniLM
+cross-encoder adds $+0.01$ to $+0.15$ over BM25 but at most $+0.005$ over Hybrid. RankGPT on the same
+BM25 list as BM25+CE is far better on every collection ($+0.076$ on SciFact, $+0.078$ on FiQA,
+$+0.116$ on TREC-COVID).
+
+\paragraph{Recall@100.} Semantic first stages miss fewer relevant documents (Table~\ref{tab:sec}),
+e.g.\ FiQA $0.553\to0.727$ (HyDE-bge) and NFCorpus $0.247\to0.333$. The rerankers cannot raise
+Recall@100 above that of their first stage, which matters for retrieval-augmented generation, where
+the LLM only sees what the first stage retrieved.
+
+\subsection{Judgment holes: does pooling bias favour BM25?}\label{sec:holes}
+Semantic systems retrieve many documents that were never judged; scoring them as non-relevant could
+understate those systems. Following Thomas et al.~\cite{thomas2024llmjudge}, we labelled every
+unjudged document in any system's top 10 with an LLM judge using the paper's prompt: 63,029 pairs
+in total, 18 of which failed and stay unjudged.
+
+\textbf{Validation first.} On 200 stratified human-judged TREC-COVID pairs, the judge agrees with
+humans at Cohen's $\kappa=0.53$ (binary and 3-class linear-weighted) and 62.5\% exact agreement, which
+is moderate agreement. The other qrels contain only relevant documents, so $\kappa$ is undefined there;
+the judge labels 80\% (SciFact) and 91\% (FiQA) of known-relevant documents as relevant, but only 27\%
+on NFCorpus, whose relevance labels come from citation links rather than direct reading. The
+NFCorpus augmented numbers should therefore not be relied on.
+
+\textbf{Results.} Table~\ref{tab:aug} rescored all systems with human labels plus LLM labels for
+the holes. All scores rise, because the holes contain relevant documents, and the semantic and LLM
+systems gain the most: on FiQA, BM25 rises $0.253\to0.506$ while HyDE-bge rises $0.410\to0.751$ and
+RankGPT $0.429\to0.799$; on TREC-COVID, Dense's gain over BM25 grows from $+0.147$ to $+0.169$. So
+pooling bias does affect these comparisons, and if anything it understates the semantic methods.
+One caveat applies to the LLM methods: an LLM judge may favour documents another LLM picked, even a
+different model.
 
 \section{Cost}
 Table~\ref{tab:lat} gives the latencies. BM25 answers in 0.1--1.7\,ms, Dense and Hybrid in 5--10\,ms,
@@ -433,7 +504,18 @@ calls, roughly 110M input tokens in total.
   seeing results; latency was measured on one laptop and is indicative only.
 \end{itemize}
 
-\section{Verdict}
+\section{Conclusion}\label{sec:concl}
+\textbf{For CCDB Search.} HyDE with a normalized encoder is a strong, training-free way to bridge the
+gap between short queries and long consumer-written narratives: it was the best first-stage
+retriever on three of four collections, and the geometry analysis shows why it works and when it
+breaks. Its costs are latency (10--19\,s per query with 8 samples) and per-query variance (10--31\,\%
+of queries rank their first relevant document lower). Both can be managed: fewer samples, a faster
+generator, caching, fusion with dense or BM25 results, and showing dense results first. The prompt
+should ask for complaint narratives in the consumers' own style, and the system should be checked on
+a small set of judged CCDB queries before it is relied on.
+
+
+\textbf{Semantic search in general.} Against BM25, semantic search helped on every collection:
 \begin{itemize}
 \item \textbf{SciFact:} yes, modestly for cheap methods (Hybrid $+0.045$, $p<0.001$), substantially for
   LLM methods (HyDE-bge $+0.090$, RankGPT $+0.086$).
@@ -443,10 +525,10 @@ calls, roughly 110M input tokens in total.
 \item \textbf{TREC-COVID:} yes, strongly (Hybrid $+0.169$, RankGPT $+0.268$, $p<0.001$).
 \end{itemize}
 Semantic search helps most when queries are natural-language questions worded differently from the
-documents. A small supervised bi-encoder fused with BM25 delivers most of the gain for about
-10\,ms per query. LLM reranking delivers the best quality measured here, beyond the published
-gpt-4 numbers, at roughly 3,000--5,000 times the latency. HyDE's benefit depends on the generator and
-encoder working together, and does not carry over automatically to a new LLM.
+documents, which is the CCDB Search setting. A small supervised bi-encoder fused with BM25 delivers
+most of the gain for about 10\,ms per query, and LLM reranking (RankGPT) delivers the best quality
+measured here at roughly 3,000--5,000 times the latency. HyDE sits between them: better than any
+other first-stage retriever on most collections, for the price of one LLM call per query.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
