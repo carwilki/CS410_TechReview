@@ -39,7 +39,8 @@ wheels/
 /paired_tests.csv
 /published_comparison.csv
 /eval_info.json
-/hyde_geometry.json
+/hyde_geometry*.json
+/hyde_llama_comparison.*
 /examples.md
 /RESULT.md
 /ndcg10.png
@@ -49,10 +50,10 @@ wheels/
 
 # Report: generated tables/figures and LaTeX build files (report.pdf itself is kept)
 /report/tables.tex
-/report/hyde_geometry.tex
+/report/hyde_geometry*.tex
 /report/ndcg10.pdf
-/report/hyde_pca.pdf
-/report/hyde_scatter.pdf
+/report/hyde_pca*.pdf
+/report/hyde_scatter*.pdf
 /report/*.aux
 /report/*.bbl
 /report/*.blg

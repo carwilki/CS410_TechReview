@@ -21,8 +21,9 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from retrieval_eval.common import BEIR_SETS, HERE, device, load, seed_all
-from retrieval_eval.llm import GPT_OSS
-from retrieval_eval.methods.hyde import EMB, ENCODERS, STOP, shorten
+import argparse
+
+from retrieval_eval.methods.hyde import EMB, ENCODERS, GENERATORS, STOP, shorten
 
 REPORT = HERE / "report"
 # Validated default categorical slots (dataviz palette): blue, orange, aqua; gray for background docs.
@@ -30,14 +31,17 @@ C_Q, C_H, C_R, C_BG, INK, INK2 = "#2a78d6", "#eb6834", "#1baf7a", "#c9c8c2", "#0
 EXAMPLE = ("scifact", None)  # dataset for the PCA picture; qid chosen automatically (largest rank gain)
 
 
-def generations(ds):
+SFX = ""  # output-file suffix: "" for gpt-oss (the report's figures), "-llama" for the Llama generator
+
+
+def generations(ds, g=GENERATORS["gpt-oss"]):
     """Read the cached HyDE passages for `ds` straight from the JSONL cache: {qid: [text]*N}."""
     gen = {}
-    with open(HERE / "llm_cache" / f"{GPT_OSS}.jsonl") as f:
+    with open(HERE / "llm_cache" / f"{g['model']}.jsonl") as f:
         for line in f:
             r = json.loads(line)
             t = r.get("tag", "")
-            if t.startswith(f"hyde:{ds}:"):
+            if t.startswith(f"{g['tag']}:{ds}:"):
                 _, _, qid, i = t.split(":")
                 gen.setdefault(qid, {})[int(i)] = r["text"].split(STOP)[0].strip()  # last record wins, as in the run
     return {q: [v[i] for i in sorted(v) if v[i]] for q, v in gen.items()}
@@ -131,7 +135,7 @@ def scatter(per_ds):
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
     axes[0].set_ylabel("rank with HyDE vector", fontsize=7, color=INK2)
-    fig.savefig(REPORT / "hyde_scatter.pdf")
+    fig.savefig(REPORT / f"hyde_scatter{SFX}.pdf")
 
 
 def pca_plot(keep, rows, embu):
@@ -167,7 +171,7 @@ def pca_plot(keep, rows, embu):
     ax.legend(fontsize=7, frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5))
     ax.set_title(f"SciFact query {q}: first relevant doc rank {by[q]['rank_q']} $\\to$ {by[q]['rank_v']}",
                  fontsize=9, color=INK)
-    fig.savefig(REPORT / "hyde_pca.pdf")
+    fig.savefig(REPORT / f"hyde_pca{SFX}.pdf")
     return {"top_q": [int(j in rel) for j in top_q], "top_v": [int(j in rel) for j in top_v], "qid": q, "query": qtext, "passage": hyps[0], "rank_q": by[q]["rank_q"], "rank_v": by[q]["rank_v"],
             "cos_q_rel": by[q]["cos_q_rel"], "cos_v_rel": by[q]["cos_v_rel"]}
 
@@ -188,8 +192,8 @@ def table(summ):
     L += [r"\end{tabular}}",
           r"\caption{HyDE geometry, computed from the cached generations. Cosines use unit vectors; ranks use the "
           r"scoring of the actual run. ``\% rank better'' is the share of queries whose first relevant document "
-          r"moves up when $f(q)$ is replaced by the HyDE vector.}\label{tab:hydegeo}", r"\end{table}"]
-    (REPORT / "hyde_geometry.tex").write_text("\n".join(L) + "\n")
+          r"moves up when $f(q)$ is replaced by the HyDE vector.}\label{tab:hydegeo" + SFX + "}", r"\end{table}"]
+    (REPORT / f"hyde_geometry{SFX}.tex").write_text("\n".join(L) + "\n")
 
 
 def main():
@@ -197,7 +201,12 @@ def main():
     seed_all()
     dev = device()
     summ, out, per_ds_bge, example = {}, {}, {}, None
-    gens = {ds: generations(ds) for ds in BEIR_SETS}
+    global SFX
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--llm", choices=list(GENERATORS), default="gpt-oss", help="which generator's cached passages")
+    g = GENERATORS[ap.parse_args().llm]
+    SFX = g["suffix"]
+    gens = {ds: generations(ds, g) for ds in BEIR_SETS}
     for enc, (mid, qprefix) in ENCODERS.items():
         model = SentenceTransformer(mid, device=dev)
         summ[enc], out[enc] = {}, {}
@@ -211,7 +220,7 @@ def main():
                     example = pca_plot(keep, rows, embu)
     scatter(per_ds_bge)
     table(summ)
-    (HERE / "hyde_geometry.json").write_text(json.dumps({"summary": summ, "example": example}, indent=1))
+    (HERE / f"hyde_geometry{SFX}.json").write_text(json.dumps({"summary": summ, "example": example}, indent=1))
     print("example:", json.dumps(example)[:600])
 
 

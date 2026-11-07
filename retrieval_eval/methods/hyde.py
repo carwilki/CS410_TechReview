@@ -14,7 +14,10 @@ Systems written:
   HyDE-Contriever-100w  our deviation: markdown stripped and each hypothetical doc cut to 100
                    words before encoding. gpt-oss writes ~500-word markdown answers; Contriever's
                    unnormalised mean-pooled vectors are swamped by them (FiQA 0.063 faithful).
-LLM: gpt-oss-120b via Databricks Unity Gateway (paper used text-davinci-003).
+LLM: gpt-oss-120b via Databricks Unity Gateway (paper used text-davinci-003). `--llm llama` instead uses
+Llama 3.3 70B Instruct with the same prompts and sampling, writing the same three systems with a
+"-llama" suffix (HyDE-bge-llama, HyDE-Contriever-llama, HyDE-Contriever-100w-llama); the gpt-oss
+path, its cache keys and its run files are unchanged.
 Published nDCG@10 (HyDE Table 2): Contriever SciFact 64.9 / FiQA 24.5 / TREC-COVID 27.3;
 HyDE 69.1 / 27.3 / 59.3. NFCorpus not reported.
 """
@@ -27,7 +30,7 @@ from sentence_transformers import SentenceTransformer
 from transformers.utils import logging as hf_logging
 
 from retrieval_eval.common import HERE, TOPK, cli, device, hf_revision, load, seed_all, write_run, write_timing
-from retrieval_eval.llm import GPT_OSS, LLM
+from retrieval_eval.llm import GPT_OSS, LLAMA, LLM
 
 N, TEMP, MAX_TOKENS, STOP = 8, 0.7, 512, "\n\n\n"
 PROMPTS = {  # verbatim from texttron/hyde src/hyde/promptor.py
@@ -40,6 +43,15 @@ PROMPTS = {  # verbatim from texttron/hyde src/hyde/promptor.py
 ENCODERS = {
     "bge": ("BAAI/bge-small-en-v1.5", "Represent this sentence for searching relevant passages: "),
     "contriever": ("facebook/contriever", ""),
+}
+# Generator configs: model, run-name suffix, cache tag prefix, extra request params.
+# gpt-oss keeps exactly its original params/tags so its cached generations are reused unchanged.
+GENERATORS = {
+    "gpt-oss": {"model": GPT_OSS, "suffix": "", "tag": "hyde",
+                "params": {"max_output_tokens": MAX_TOKENS + 256,  # + small budget for gpt-oss reasoning
+                           "reasoning": {"effort": "low"}}},
+    "llama": {"model": LLAMA, "suffix": "-llama", "tag": "hyde-llama",
+              "params": {"max_output_tokens": MAX_TOKENS}},  # non-reasoning model: the paper's 512 tokens
 }
 EMB = HERE / "emb_cache"  # corpus embeddings cached across runs (encoding is the slow part)
 SHORT_WORDS = 100
@@ -58,25 +70,26 @@ def shorten(t):
 def opts(ap):
     """Add the --generate-only CLI flag."""
     ap.add_argument("--generate-only", action="store_true", help="only generate (and cache) hypothetical docs")
+    ap.add_argument("--llm", choices=list(GENERATORS), default="gpt-oss", help="generator for the hypothetical docs")
+    ap.add_argument("--limit", type=int, default=0, help="only the first N queries per dataset (smoke test; no runs written)")
 
 
-def generate(llm, ds, queries):
+def generate(llm, ds, queries, gen=GENERATORS["gpt-oss"]):
     """Generate N hypothetical documents per query with the LLM.
 
     Returns {qid: [doc_text, ...]} (N entries, possibly empty strings on failure). Each sample
     gets a distinct `_salt` so the LLM cache stores N separate samples instead of one.
     """
-    jobs = [(PROMPTS[ds].format(q), f"hyde:{ds}:{qid}:{i}",
-             {"temperature": TEMP, "max_output_tokens": MAX_TOKENS + 256,  # + small budget for gpt-oss reasoning
-              "reasoning": {"effort": "low"}, "_salt": i})
+    jobs = [(PROMPTS[ds].format(q), f"{gen['tag']}:{ds}:{qid}:{i}",
+             {"temperature": TEMP, **gen["params"], "_salt": i})
             for qid, q in queries.items() for i in range(N)]
     outs = llm.map(jobs, desc=f"HyDE {ds}")
-    gen = {}
+    out = {}
     for (_, tag, _), text in zip(jobs, outs):
-        qid = tag.split(":")[2]  # tag = "hyde:{ds}:{qid}:{i}"
+        qid = tag.split(":")[2]  # tag = "{prefix}:{ds}:{qid}:{i}"
         # Apply the official stop sequence client-side (truncate at the first triple newline).
-        gen.setdefault(qid, []).append(text.split(STOP)[0].strip())
-    return gen
+        out.setdefault(qid, []).append(text.split(STOP)[0].strip())
+    return out
 
 
 def corpus_embeddings(model, name, ds, ids, texts):
@@ -112,16 +125,19 @@ def main():
     args = cli(__doc__, opts)
     seed_all()
     hf_logging.set_verbosity_error()
-    llm = LLM(GPT_OSS)
+    gen = GENERATORS[args.llm]
+    llm = LLM(gen["model"])
     # Phase 1: all LLM generation up front (cached on disk), before any model is loaded.
     gens = {}
     for ds in args.datasets:
         _, queries, _ = load(ds)
-        gens[ds] = generate(llm, ds, queries)
+        if args.limit:
+            queries = dict(list(queries.items())[:args.limit])
+        gens[ds] = generate(llm, ds, queries, gen)
         empty = sum(1 for v in gens[ds].values() for t in v if not t)
         print(f"[HyDE] {ds}: generated {sum(len(v) for v in gens[ds].values())} docs ({empty} empty)", flush=True)
     stats = llm.report("HyDE generation")
-    if args.generate_only:
+    if args.generate_only or args.limit:
         return
 
     # Phase 2: per encoder, embed corpus once and build all its query variants from the same doc vectors.
@@ -135,7 +151,7 @@ def main():
             emb, enc_s = corpus_embeddings(model, enc, ds, ids, [corpus[i] for i in ids])
             k = min(TOPK, len(ids))
             # LLM latency per query: the N samples are independent, so time = slowest sample
-            rec = {r["tag"]: r["seconds"] for r in llm.cache.values() if r.get("tag", "").startswith(f"hyde:{ds}:")}
+            rec = {r["tag"]: r["seconds"] for r in llm.cache.values() if r.get("tag", "").startswith(f"{gen['tag']}:{ds}:")}
             runs = {"hyde": {}, "plain": {}, "short": {}}
             t_hyde, t_plain, t_short = [], [], []
             for qid, q in queries.items():
@@ -149,7 +165,7 @@ def main():
                 de = model.encode(docs, normalize_embeddings=norm, convert_to_numpy=True) if docs else np.zeros((0, len(qe)))
                 qv = np.vstack([qe[None, :], de]).mean(axis=0)  # Eq. 8: mean of f(q) and f(d_hat_k)
                 runs["hyde"][qid] = search(emb, qv, ids, k)
-                llm_s = max((rec.get(f"hyde:{ds}:{qid}:{i}", 0.0) for i in range(N)), default=0.0)
+                llm_s = max((rec.get(f"{gen['tag']}:{ds}:{qid}:{i}", 0.0) for i in range(N)), default=0.0)
                 t_hyde.append(time.perf_counter() - t + llm_s)
                 if enc == "contriever":
                     # Deviation: same averaging, but each hypothetical doc is shortened first.
@@ -158,8 +174,11 @@ def main():
                     runs["short"][qid] = search(emb, np.vstack([qe[None, :], de]).mean(axis=0), ids, k)
                     t_short.append(time.perf_counter() - t + llm_s)
             # Map each run variant to its output system name (None = don't write).
-            names = {"hyde": "HyDE-bge" if enc == "bge" else "HyDE-Contriever", "plain": None if enc == "bge" else "Contriever",
-                     "short": None if enc == "bge" else "HyDE-Contriever-100w"}
+            sfx = gen["suffix"]
+            names = {"hyde": ("HyDE-bge" if enc == "bge" else "HyDE-Contriever") + sfx,
+                     # plain Contriever does not depend on the generator: written only on the gpt-oss path
+                     "plain": None if enc == "bge" or sfx else "Contriever",
+                     "short": None if enc == "bge" else "HyDE-Contriever-100w" + sfx}
             for kind, name in names.items():
                 if name is None:
                     continue  # plain bge = Dense, already produced by retrieval_eval.methods.dense
@@ -168,7 +187,7 @@ def main():
                 write_timing(ds, name, {"system": name, "mean_ms": 1000 * float(np.mean(times)), "encode_s": enc_s,
                                         "setup_s": enc_s, "n_queries": len(times), "encoder": mid,
                                         "encoder_revision": hf_revision(mid), "device": dev,
-                                        **({"llm": GPT_OSS, "n_samples": N, "temperature": TEMP,
+                                        **({"llm": gen["model"], "n_samples": N, "temperature": TEMP,
                                             "note": "mean_ms includes the slowest of the N parallel LLM calls",
                                             "llm_stats": stats} if kind != "plain" else {})})
                 print(f"[{name}] {ds}: {1000 * np.mean(times):.1f} ms/q (corpus encode {enc_s:.0f}s)", flush=True)

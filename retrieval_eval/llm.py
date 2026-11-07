@@ -22,6 +22,8 @@ from retrieval_eval.common import HERE
 # Gateway model names (Unity Catalog system.ai models).
 GPT_OSS = "system.ai.gpt-oss-120b"
 QWEN = "system.ai.qwen35-122b-a10b"
+LLAMA = "system.ai.meta-llama-3-3-70b-instruct"  # alternative HyDE generator (non-reasoning, open-weight)
+CHAT_MODELS = {LLAMA}  # services that reject the Responses API: called via the unified Chat Completions API
 PROFILE = os.environ.get("LLM_PROFILE", "bops-prod-new")
 HOST = os.environ.get("DATABRICKS_HOST", "https://adb-7405609759660295.15.azuredatabricks.net").rstrip("/")
 CACHE = HERE / "llm_cache"
@@ -97,14 +99,25 @@ class LLM:
         for attempt in range(8):
             try:
                 t = time.perf_counter()
-                r = self._client().responses.create(model=self.model, input=input_, **params)
-                dt = time.perf_counter() - t
-                u = getattr(r, "usage", None)
-                rec = {"key": k, "tag": tag, "text": r.output_text or "", "seconds": dt,
-                       "in": getattr(u, "input_tokens", 0) if u else 0,
-                       "out": getattr(u, "output_tokens", 0) if u else 0,
-                       "reasoning": (getattr(getattr(u, "output_tokens_details", None), "reasoning_tokens", 0) or 0)
-                       if u else 0}
+                if self.model in CHAT_MODELS:
+                    # Chat Completions: string input becomes one user message; max_output_tokens -> max_tokens.
+                    msgs = [{"role": "user", "content": input_}] if isinstance(input_, str) else input_
+                    cp = {("max_tokens" if p == "max_output_tokens" else p): v for p, v in params.items()}
+                    r = self._client().chat.completions.create(model=self.model, messages=msgs, **cp)
+                    dt = time.perf_counter() - t
+                    u = getattr(r, "usage", None)
+                    rec = {"key": k, "tag": tag, "text": (r.choices[0].message.content if r.choices else "") or "",
+                           "seconds": dt, "in": getattr(u, "prompt_tokens", 0) if u else 0,
+                           "out": getattr(u, "completion_tokens", 0) if u else 0, "reasoning": 0}
+                else:
+                    r = self._client().responses.create(model=self.model, input=input_, **params)
+                    dt = time.perf_counter() - t
+                    u = getattr(r, "usage", None)
+                    rec = {"key": k, "tag": tag, "text": r.output_text or "", "seconds": dt,
+                           "in": getattr(u, "input_tokens", 0) if u else 0,
+                           "out": getattr(u, "output_tokens", 0) if u else 0,
+                           "reasoning": (getattr(getattr(u, "output_tokens_details", None), "reasoning_tokens", 0) or 0)
+                           if u else 0}
                 # Persist immediately so an interrupted run keeps every completed call.
                 with self.wlock:
                     self.cache[k] = rec
