@@ -1,0 +1,174 @@
+% How each method works: one short definition and one diagram per method family.
+\tikzset{
+  box/.style={draw, rounded corners=2pt, align=center, font=\footnotesize, minimum height=6mm, inner sep=3pt, fill=white},
+  doc/.style={box, fill=gray!10},
+  llm/.style={box, fill=red!10},
+  model/.style={box, fill=blue!8},
+  arr/.style={-{Stealth[length=2mm]}, semithick},
+  lab/.style={font=\scriptsize\itshape, text=black!65}
+}
+
+\section{How each method works}\label{sec:methods}
+This section defines each method in a few sentences and shows its data flow. $q$ is the query, $d$
+a document, and every method ends with a ranked list of document ids.
+
+\subsection{BM25 (lexical baseline)~\cite{kamphuis2020bm25,thakur2021beir}}
+BM25 scores a document by the query terms it contains. Each matching term contributes its inverse
+document frequency (rare terms count more), damped by term frequency (controlled by $k_1$) and
+normalized by document length (controlled by $b$):
+$\mathrm{score}(q,d)=\sum_{t\in q}\mathrm{idf}(t)\,\frac{tf_{t,d}(k_1+1)}{tf_{t,d}+k_1(1-b+b\,|d|/\overline{|d|})}$.
+Text is tokenized and stemmed first, so ``running'' matches ``run'', but ``car'' never matches
+``automobile''. An inverted index makes this very fast. BM25-BEIR is the same formula with BEIR's
+parameters and with title and body scored separately and summed.
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[doc] (c) {Corpus};
+\node[box, right=of c] (t) {Tokenize, stem,\\drop stopwords};
+\node[box, right=of t] (i) {Inverted index\\term $\to$ docs, tf};
+\node[box, right=of i] (s) {Sum BM25 term\\scores per doc};
+\node[box, right=of s] (r) {Top 100};
+\node[doc, above=4mm of t] (q) {Query $q$};
+\draw[arr] (c)--(t); \draw[arr] (t)--(i); \draw[arr] (i)--(s); \draw[arr] (s)--(r);
+\draw[arr] (q) -| (s);
+\end{tikzpicture}\end{center}
+
+\subsection{SPLADE (learned sparse retrieval)~\cite{formal2021splade,formal2021spladev2}}
+SPLADE keeps BM25's ``bag of weighted terms'' form but lets a BERT model choose the terms and
+weights. For every token position, the masked-language-model head predicts a score for each of
+the 30,522 vocabulary terms. These are passed through $\log(1+\mathrm{ReLU}(\cdot))$ and max-pooled
+over positions, giving one sparse vector per text. The vector also contains related terms that
+never appear in the text (\emph{expansion}, e.g.\ ``car'' $\to$ ``vehicle''). Relevance is the dot
+product of the query and document vectors, which an inverted index can compute.
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[doc] (d) {Text};
+\node[model, right=of d] (b) {BERT + MLM head\\(score per vocab term)};
+\node[box, right=of b] (p) {$\log(1{+}\mathrm{ReLU})$,\\max-pool};
+\node[box, right=of p] (v) {Sparse vector\\\scriptsize car:2.1 vehicle:1.3 \dots};
+\node[box, right=of v] (s) {$\mathbf{q}\cdot\mathbf{d}$};
+\draw[arr] (d)--(b); \draw[arr] (b)--(p); \draw[arr] (p)--(v); \draw[arr] (v)--(s);
+\node[lab, below=1mm of b] {same model for queries and documents};
+\end{tikzpicture}\end{center}
+
+\subsection{Dense bi-encoder (Dense = bge-small, Contriever)~\cite{karpukhin2020dpr,xiao2023cpack,izacard2022contriever}}
+A transformer encodes the query and each document \emph{separately} into a single dense vector
+(384 dimensions for bge-small, 768 for Contriever). Training places texts with the same meaning
+close together, so a query and a relevant document match even if they share no words. Relevance is
+cosine similarity (bge, normalized vectors) or a dot product (Contriever). Document vectors are
+computed once, offline; at query time only the query is encoded, followed by a nearest-neighbour
+search. bge-small is fine-tuned on large supervised relevance data; Contriever is trained without
+labels (contrastive learning on text crops), which explains its weaker results.
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[doc] (d) {Documents};
+\node[model, right=of d] (ed) {Encoder};
+\node[box, right=of ed] (ix) {Vector store\\(offline)};
+\node[doc, below=5mm of d] (q) {Query $q$};
+\node[model, right=of q] (eq) {Encoder\\\scriptsize(same weights)};
+\node[box, right=of eq] (qv) {Query vector};
+\node[box, right=12mm of ix, yshift=-5.5mm] (s) {Cosine / dot\\nearest neighbours};
+\node[box, right=of s] (r) {Top 100};
+\draw[arr] (d)--(ed); \draw[arr] (ed)--(ix); \draw[arr] (q)--(eq); \draw[arr] (eq)--(qv);
+\draw[arr] (ix)--(s); \draw[arr] (qv)--(s); \draw[arr] (s)--(r);
+\end{tikzpicture}\end{center}
+
+\subsection{ColBERTv2 with PLAID (late interaction)~\cite{khattab2020colbert,santhanam2022colbertv2,santhanam2022plaid}}
+ColBERT keeps one vector \emph{per token} instead of one per text. A query is scored against a
+document by MaxSim: each query token finds its most similar document token, and these maxima are
+summed, $\mathrm{score}=\sum_{i\in q}\max_{j\in d}\mathbf{q}_i\cdot\mathbf{d}_j$. This captures
+term-level matches with contextual meaning. Storing every token vector is expensive, so ColBERTv2
+compresses each one to a cluster centroid plus a 2-bit residual. PLAID first uses the centroids to
+pick a small candidate set cheaply, then computes exact MaxSim only for those candidates.
+\begin{center}\begin{tikzpicture}[node distance=5mm]
+\node[doc] (q) {Query tokens\\\scriptsize $q_1\dots q_{32}$};
+\node[model, right=of q] (e) {BERT\\token vectors};
+\node[box, right=of e] (c) {PLAID: centroid\\candidate pruning};
+\node[box, right=of c] (m) {MaxSim per\\query token, sum};
+\node[box, right=of m] (r) {Top 100};
+\node[doc, below=5mm of c] (ix) {Compressed doc token vectors\\(centroid + 2-bit residual)};
+\draw[arr] (q)--(e); \draw[arr] (e)--(c); \draw[arr] (c)--(m); \draw[arr] (m)--(r);
+\draw[arr] (ix)--(c); \draw[arr] (ix) -| (m);
+\end{tikzpicture}\end{center}
+
+\subsection{Hybrid: Reciprocal Rank Fusion~\cite{cormack2009rrf}}
+RRF merges several ranked lists using only the rank positions, so scores on different scales
+(BM25 points vs.\ cosine similarities) never need calibrating. Each document receives
+$\sum_{\ell}1/(60+\mathrm{rank}_\ell(d))$ over the lists that contain it. A document ranked highly
+by either list, or moderately by both, rises to the top. Here the lists are the BM25 and Dense top 100.
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[box] (b) {BM25 top 100};
+\node[box, below=3mm of b] (d) {Dense top 100};
+\node[box, right=10mm of b, yshift=-4.5mm] (f) {$\sum 1/(60+\mathrm{rank})$\\per document};
+\node[box, right=of f] (r) {Fused top 100};
+\draw[arr] (b)--(f); \draw[arr] (d)--(f); \draw[arr] (f)--(r);
+\end{tikzpicture}\end{center}
+
+\subsection{Cross-encoder reranking (Rerank, BM25+CE)~\cite{thakur2021beir,wang2020minilm}}
+A cross-encoder reads the query and one document \emph{together} in a single transformer pass
+(``[CLS] query [SEP] document''), so every query word can attend to every document word. It outputs
+one relevance score. This is more accurate than comparing separately computed vectors, but it must
+run once per (query, document) pair at query time, so it is applied only to a shortlist from a
+first-stage retriever: the Hybrid top 50 (Rerank) or the BM25-BEIR top 100 (BM25+CE).
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[box] (f) {First stage\\top $k$};
+\node[model, right=10mm of f] (ce) {MiniLM cross-encoder\\$[q;\,d_i]\to s_i$};
+\node[box, right=of ce] (s) {Sort by $s_i$};
+\node[box, right=of s] (r) {Reranked top $k$\\+ rest unchanged};
+\draw[arr] (f)--(ce); \draw[arr] (ce)--(s); \draw[arr] (s)--(r);
+\end{tikzpicture}\end{center}
+
+\subsection{HyDE*: Hypothetical Document Embeddings~\cite{gao2023hyde}}
+\paragraph{Idea.} A dense retriever compares the query vector $f(q)$ with every document vector
+$f(d)$ and returns the nearest. But queries and documents are different kinds of text: a query is a
+few words (``Deleting Raptor reduces G-CSF levels.''), a document is a full abstract with its own
+vocabulary. Their vectors live in different parts of the space, so the nearest documents to a
+\emph{query} need not be the documents that \emph{answer} it. HyDE turns retrieval into
+document--document similarity, which encoders are good at: an LLM \emph{writes} $N$ plausible answer
+passages $\hat d_1,\dots,\hat d_N$ (``Please write a scientific paper passage to support/refute the
+claim''), and the search looks for real documents that are close to those fake ones. The passages
+may contain invented facts; that does not matter, because they are never shown to the user, only
+encoded. The LLM never sees the corpus.
+
+\begin{center}\begin{tikzpicture}[node distance=5mm]
+\node[doc] (q) {Query $q$};
+\node[llm, right=of q] (g) {LLM writes 8\\hypothetical passages};
+\node[model, right=of g] (e) {Encoder\\$f(q),f(\hat d_1),\dots,f(\hat d_8)$};
+\node[box, right=of e] (m) {Average\\vectors $\to \mathbf v$};
+\node[box, right=of m] (s) {Nearest docs\\to $\mathbf v$ $\to$ top 100};
+\draw[arr] (q)--(g); \draw[arr] (g)--(e); \draw[arr] (e)--(m); \draw[arr] (m)--(s);
+\draw[arr] (q.south) -- ++(0,-4mm) -| node[lab, pos=0.25, below]{query also encoded} (e.south);
+\end{tikzpicture}\end{center}
+The search vector is the mean of $f(q)$ and the eight passage vectors, and the search itself is
+the same nearest-neighbour search as Dense.
+
+\noindent\textit{* HyDE is the method we plan to use for our project, CCDB Search (semantic search over the CFPB Consumer Complaint Database). How the averaged
+vector finds the right documents, our measurements of it, and what they mean for CCDB Search are in
+Section~\ref{sec:ccdb}.}
+
+\subsection{RankGPT: listwise LLM reranking~\cite{sun2023rankgpt}}
+RankGPT gives an LLM the query and 20 numbered passages and asks it to output a ranking such as
+``[3] > [1] > [7] > \dots''. Because 100 passages do not fit well in one prompt, it uses a sliding
+window: rerank positions 81--100, slide up by 10 to rerank 71--90, and so on to the top. Strong
+documents can thus ``bubble up'' from the bottom of the list. That makes 9 LLM calls per query, which
+must run in sequence. Unparseable or missing ids are appended in their original order.
+\begin{center}\begin{tikzpicture}[node distance=5mm]
+\node[box] (b) {BM25-BEIR\\top 100};
+\node[llm, right=8mm of b] (w) {LLM ranks window\\of 20 passages};
+\node[box, right=8mm of w] (p) {Parse ``[3] > [1] > \dots''\\reorder window};
+\node[box, right=8mm of p] (r) {Reranked\\top 100};
+\draw[arr] (b)--(w); \draw[arr] (w)--(p);
+\draw[arr] (p.south) -- ++(0,-5mm) -| node[lab, pos=0.25, below]{slide window up by 10 (9 windows: 81--100 \dots 1--20)} (w.south);
+\draw[arr] (p)--(r);
+\end{tikzpicture}\end{center}
+
+\subsection{LLM relevance judge (evaluation aid, not a retriever)}
+Human relevance labels exist only for documents that were in the original judgment pool, and
+unjudged documents count as non-relevant. Following Thomas et al.~\cite{thomas2024llmjudge}, an LLM (Qwen3.5) is shown the
+query and one document and asked for a 0--2 relevance grade, after considering intent match (M) and
+trustworthiness (T). We first measure its agreement with human labels, then use it only to label
+the unjudged documents in each system's top 10. Human labels are never overwritten.
+\begin{center}\begin{tikzpicture}[node distance=6mm]
+\node[box] (u) {Unjudged (q, d)\\in any top 10};
+\node[llm, right=of u] (j) {LLM judge\\0 / 1 / 2};
+\node[box, right=of j] (a) {Human qrels\\+ LLM labels};
+\node[box, right=of a] (e) {Re-score all\\systems};
+\node[box, below=4mm of j] (v) {Validate vs.\ human\\labels ($\kappa$) first};
+\draw[arr] (u)--(j); \draw[arr] (j)--(a); \draw[arr] (a)--(e); \draw[arr] (v)--(j);
+\end{tikzpicture}\end{center}
